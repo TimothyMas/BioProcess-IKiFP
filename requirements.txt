@@ -1,0 +1,9 @@
+streamlit>=1.38
+pandas>=2.2
+numpy>=2.0
+plotly>=5.23
+xlsxwriter>=3.2
+openpyxl>=3.1
+Pillow>=10.0
+requests>=2.31.0
+biopython>=1.81
