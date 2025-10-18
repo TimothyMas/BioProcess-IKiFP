@@ -1,7 +1,7 @@
 # tabs/t10_electrochem.py
 from __future__ import annotations
 import os, io, uuid, shutil, zipfile, glob
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Any, cast
 import streamlit as st
 
 # --- Safe local import of user's cv.py and chrono.py ---
@@ -35,25 +35,86 @@ def _session_tmp_dir() -> str:
     os.makedirs(root, exist_ok=True)
     return root
 
+def _to_bytes(obj: Any) -> Optional[bytes]:
+    """
+    Convert common buffer-like objects to bytes in a type-safe way.
+    We deliberately avoid a generic 'bytes(obj)' fallback to satisfy Pylance.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (bytes, bytearray)):
+        return bytes(obj)
+    if isinstance(obj, memoryview):
+        return obj.tobytes()
+
+    # Objects that expose .tobytes()
+    tb = getattr(obj, "tobytes", None)
+    if callable(tb):
+        try:
+            res: Any = tb()
+            if isinstance(res, (bytes, bytearray)):
+                return bytes(res)
+            if isinstance(res, memoryview):
+                return res.tobytes()
+        except Exception:
+            return None
+
+    # Nothing recognized
+    return None
+
 def _save_uploads(files: List[Any], subdir: str, suffix: Optional[str]=None) -> List[str]:
     """
     Save uploaded files to a session temp folder.
-    We avoid importing streamlit.runtime.* types; treat 'files' as Any with .name and .getbuffer().
+    Treat 'files' as Any with .name and bytes-returning methods.
     """
     base = os.path.join(_session_tmp_dir(), subdir + (f"_{suffix}" if suffix else ""))
     os.makedirs(base, exist_ok=True)
     paths: List[str] = []
     for f in files:
-        # Skip None/empty entries just in case
         if f is None:
             continue
         name = os.path.basename(getattr(f, "name", "upload.bin")).replace("..", ".")
         dst = os.path.join(base, name)
-        buf = getattr(f, "getbuffer", None)
-        if callable(buf):
-            with open(dst, "wb") as fh:
-                fh.write(buf())
-            paths.append(dst)
+
+        # Try getvalue() (bytes), then read() (bytes), then getbuffer() (memoryview)
+        data_bytes: Optional[bytes] = None
+
+        getvalue = getattr(f, "getvalue", None)
+        if callable(getvalue):
+            try:
+                v: Any = getvalue()
+                data_bytes = _to_bytes(v) if not isinstance(v, (bytes, bytearray)) else bytes(cast(bytes, v))
+            except Exception:
+                data_bytes = None
+
+        if data_bytes is None:
+            read = getattr(f, "read", None)
+            if callable(read):
+                try:
+                    v2: Any = read()
+                    data_bytes = _to_bytes(v2) if not isinstance(v2, (bytes, bytearray)) else bytes(cast(bytes, v2))
+                except Exception:
+                    data_bytes = None
+
+        if data_bytes is None:
+            getbuffer = getattr(f, "getbuffer", None)
+            if callable(getbuffer):
+                try:
+                    v3: Any = getbuffer()  # often returns memoryview
+                    if isinstance(v3, memoryview):
+                        data_bytes = v3.tobytes()
+                    else:
+                        data_bytes = _to_bytes(v3)
+                except Exception:
+                    data_bytes = None
+
+        if data_bytes is None:
+            # Skip files we couldn't read safely
+            continue
+
+        with open(dst, "wb") as fh:
+            fh.write(data_bytes)
+        paths.append(dst)
     return paths
 
 def _zip_dir(path: str) -> bytes:
