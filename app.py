@@ -1,432 +1,439 @@
 # app.py
 from __future__ import annotations
+import inspect
+from typing import Optional, Any
 import streamlit as st
-from typing import Mapping, Union, Optional, cast
+import pandas as pd
+import numpy as np
 
 from bpcomp.config import set_page, inject_css
-from bpcomp.presets import ORGANISMS
-from bpcomp.env_models import (
-    medium_quality_score,
-    adjust_params_by_environment,
-    acceptor_factor,
-    orp_penalty,
-    estimate_refs_from_env,
-)
-from bpcomp.state import (
-    clear_keys, ensure_cultures, add_culture, delete_culture, rename_culture,
-    get as get_ns, set as set_ns,
+from bpcomp.presets import ORGANISMS, OrganismPreset
+from bpcomp.env_models import medium_quality_score, adjust_params_by_environment
+from bpcomp.state import clear_keys
+
+# Custom helpers
+from bpcomp.custom import (
+    get_catalog, get_selected_idx, set_selected,
+    add_new_culture, duplicate_culture, delete_culture,
+    update_selected, export_catalog_json, import_catalog_json,
+    record_to_preset, default_by_o2, as_float, add_from_preset,
 )
 
+# Tabs (existing)
 from tabs import (
     t01_planning, t02_simulation, t03_monitoring, t04_harvest,
     t05_activity, t06_bradford, t07_purification, t08_plots_export, t09_settings
 )
 
-# ---- robust numeric coercion
-def as_float(x: Optional[Union[float, int, str]], default: Union[float, int, str]) -> float:
-    try:
-        return float(x) if x is not None else float(default)
-    except Exception:
-        try:
-            return float(default)
-        except Exception:
-            return 0.0
+# Optional electrochem tab
+_t10_ec: Optional[Any] = None
+try:
+    from tabs import t10_electrochem as _t10_ec
+except Exception:
+    _t10_ec = None
+
+# New tabs
+from tabs import t10_dashboard, t11_batch
+
+
+# ─────────────────────────────
+# Helpers
+# ─────────────────────────────
+
+def _safe_render(tab_module: Any, container, **kwargs) -> None:
+    """Safely call a tab module's render(container, **kwargs) with filtered args."""
+    if tab_module is None:
+        return
+    render = getattr(tab_module, "render", None)
+    if render is None:
+        return
+    sig = inspect.signature(render)
+    filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    render(container, **filtered)
+
+
+def _seed_defaults() -> None:
+    st.session_state.setdefault("org_source", "Preset")
+    st.session_state.setdefault("org_name", next(iter(ORGANISMS.keys())))
+    st.session_state.setdefault("_last_org_key", ("Preset", st.session_state["org_name"]))
+
+    org0 = ORGANISMS[st.session_state["org_name"]]
+    st.session_state.setdefault("T", float(org0.T_opt))
+    st.session_state.setdefault("pH", float(org0.pH_opt))
+    st.session_state.setdefault("O2", 21.0 if org0.O2_pref.lower() == "aerobic" else 0.5)
+
+    st.session_state.setdefault("carbon_gL", 10.0)
+    st.session_state.setdefault("N_mM", 15.0)
+    st.session_state.setdefault("salts_ok", True)
+    st.session_state.setdefault("trace_ok", True)
+    st.session_state.setdefault("vitamins_ok", True)
+
+    st.session_state.setdefault("epsilon", 3.40)
+    st.session_state.setdefault("path_cm", 1.00)
+    st.session_state.setdefault("V_rxn_mL", 1.000)
+    st.session_state.setdefault("V_samp_mL", 0.010)
+
+    st.session_state.setdefault("compact", False)
+
+
+def _apply_pending_source_switch() -> None:
+    """If a button requested switching organism source (e.g., Preset → Custom),
+    perform the switch BEFORE widgets are created in this run, then clear flags.
+    """
+    pending = st.session_state.get("_pending_source", None)
+    if not pending:
+        return
+
+    # Set the radio value safely (widget not created yet in this run)
+    st.session_state["org_source"] = pending
+
+    if pending == "Custom library":
+        idx = st.session_state.get("_pending_custom_select_idx", None)
+        if idx is not None:
+            try:
+                set_selected(int(idx))
+            except Exception:
+                pass
+
+    # Cleanup flags
+    for k in ("_pending_source", "_pending_custom_select_idx"):
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def _load_demo_run() -> None:
+    # Growth / sim demo
+    t = np.arange(0, 18.01, 2.0)
+    od = np.array([0.0494, 0.0656, 0.0985, 0.1467, 0.2171, 0.3178, 0.4586, 0.6487, 0.8936, 1.1908])
+    growth_df = pd.DataFrame({"time_h": t[:len(od)], "od600": od, "replicate": ["A"] * len(od)})
+    growth_df["valid"] = True
+    growth_df["od600_smooth"] = growth_df["od600"]
+    st.session_state["growth_df"] = growth_df
+
+    st.session_state["sim_df"] = pd.DataFrame({
+        "time_h": t[:len(od)], "OD600": od, "log10_OD600": np.log10(od), "CFU_per_mL": od * 8e8
+    })
+
+    # Assay demo
+    eps = float(st.session_state.get("epsilon", 3.40))
+    path = float(st.session_state.get("path_cm", 1.00))
+    Vrxn = float(st.session_state.get("V_rxn_mL", 1.000))
+    Vsamp = float(st.session_state.get("V_samp_mL", 0.010))
+
+    act_raw = pd.DataFrame({
+        "Sample": ["Peak_1", "Peak_2", "Peak_3", "Endpoint", "Supernatant"],
+        "Background_mABS_min": [0.56, 0.62, 1.31, 0.66, 10.46],
+        "ValueAfter_mABS_min": [237.47, 246.41, 227.87, 50.69, 125.31],
+        "PreDilution": [5, 5, 5, 1, 15]
+    })
+    calc = act_raw.copy()
+    calc["Final_mABS_min"] = calc["ValueAfter_mABS_min"] - calc["Background_mABS_min"]
+    calc["Rate_mM_min"] = (calc["Final_mABS_min"] / 1000.0) / max(eps * path, 1e-12)
+    calc["U_per_mL_stock"] = calc["Rate_mM_min"] * (Vrxn / max(Vsamp, 1e-12)) * calc["PreDilution"].clip(lower=1)
+    st.session_state["assay_calc"] = calc
+
+    # Bradford demo
+    prot = pd.DataFrame({"Sample": ["Peak_pool", "Endpoint", "Supernatant"],
+                         "A595": [0.617667, 0.210000, 0.933667], "Dilution": [5, 1, 15]})
+    prot["Protein_mg_mL"] = [2.1, 0.35, 3.0]
+    st.session_state["protein_table"] = prot
+
+    # Reset KPIs/purif (will be recomputed)
+    st.session_state["purif_full"] = pd.DataFrame()
+    st.session_state["kpis"] = {}
+
+
+# ─────────────────────────────
+# App bootstrap
+# ─────────────────────────────
 
 set_page()
 inject_css()
+_seed_defaults()
+_apply_pending_source_switch()
 
 st.title("🧫 Bioprocess Companion")
-st.caption("Multi-culture ready • Use the selector below to switch between cultures")
+st.caption("Simulate & plan cultures • Monitor OD/CFU • Predict harvest • Medium planner • Activity & purification • Plots • Exports")
 
-# ── Sidebar: culture manager, organism, environment
+qa1, qa2 = st.columns([1, 1])
+with qa1:
+    if st.button("📦 Load demo run", type="secondary",
+                 help="Prefill all tabs with a consistent demo dataset you can edit."):
+        _load_demo_run()
+        st.toast("Demo data loaded.", icon="✅")
+with qa2:
+    st.toggle("Compact layout", key="compact", help="Smaller paddings & controls; nice for small screens.")
+    if st.session_state.get("compact"):
+        st.markdown("""
+        <style>.block-container{padding-top:.6rem}.stButton>button,.stDownloadButton>button{padding:.3rem .55rem}
+        label,.stRadio>div[role=radiogroup]{font-size:.95rem}</style>
+        """, unsafe_allow_html=True)
+
+# ─────────────────────────────
+# Sidebar — Setup & Constants
+# ─────────────────────────────
 with st.sidebar:
     st.header("⚙️ Setup & Constants")
 
-    # --- Culture manager ---
-    st.markdown("**Cultures**")
-    cultures = ensure_cultures()
-    if "current_culture" not in st.session_state:
-        st.session_state["current_culture"] = cultures[0]
-    cur = st.selectbox("Active culture", cultures,
-                       index=(cultures.index(st.session_state["current_culture"])
-                              if st.session_state["current_culture"] in cultures else 0))
-    st.session_state["current_culture"] = cur
-
-    cadd, cdel = st.columns([2, 1])
-    new_name = cadd.text_input("New culture name", value="", placeholder="e.g., Culture 2")
-    if cadd.button("➕ Add"):
-        name_to_add = new_name or f"Culture {len(cultures) + 1}"
-        add_culture(name_to_add)
-        st.session_state["current_culture"] = name_to_add
-        st.rerun()
-    if cdel.button("🗑️ Delete", help="Keeps at least one culture"):
-        delete_culture(cur)
-        st.rerun()
-
-    r1, r2 = st.columns([2, 1])
-    rename_to = r1.text_input("Rename", value=cur)
-    if r2.button("✏️ Apply") and rename_to and rename_to != cur:
-        rename_culture(cur, rename_to)
-        st.session_state["current_culture"] = rename_to
-        st.rerun()
-
-    st.divider()
-
-    # --- Organism source (fixed: no double-click) ---
-    st.caption("Organism source")
-
-    org_mode_key = f"{cur}::org_mode"
-    if org_mode_key not in st.session_state:
-        st.session_state[org_mode_key] = "Preset"
-    org_mode = st.radio(
-        "Source",
-        ["Preset", "Custom"],
+    src = st.radio(
+        "Organism source",
+        ["Preset", "Custom library"],
         horizontal=True,
-        index=["Preset", "Custom"].index(st.session_state[org_mode_key]),
-        key=org_mode_key,
+        key="org_source",
+        help="Use a built-in preset or your own saved cultures (add/duplicate/import/export)."
     )
 
-    if org_mode == "Preset":
-        preset_key = f"{cur}::preset_name"
-        preset_names = list(ORGANISMS.keys())
-        if preset_key not in st.session_state:
-            st.session_state[preset_key] = preset_names[0]
-        try:
-            preset_index = preset_names.index(st.session_state[preset_key])
-        except ValueError:
-            preset_index = 0
+    if src == "Preset":
+        # Choose preset
+        if "org_name" not in st.session_state:
+            st.session_state["org_name"] = next(iter(ORGANISMS.keys()))
         org_name = st.selectbox(
-            "Organism preset",
-            preset_names,
-            index=preset_index,
-            key=preset_key,
+            "Preset organism",
+            list(ORGANISMS.keys()),
+            index=list(ORGANISMS.keys()).index(st.session_state["org_name"]),
+            key="org_name",
+            help="Choose a built-in organism profile."
         )
+        org = ORGANISMS[org_name]
 
-        p = ORGANISMS[org_name]
-        org = dict(
-            mode="Preset",
-            name=p.name,
-            T_opt=float(p.T_opt),
-            pH_opt=float(p.pH_opt),
-            O2_pref=str(p.O2_pref),
-            mu_ref=float(p.mu_ref),
-            K_ref=float(p.K_ref),
-            lag_ref_h=float(p.lag_ref_h),
-            notes=str(p.notes),
-            auto_refs=False,
-            cfu_per_od=4e8 if "Aromatoleum" in p.name else 8e8,
-            o2_tol_pct=0.5 if p.O2_pref == "anaerobic" else 5.0,
-        )
-        set_ns(cur, "organism", org)
+        # Actions
+        c_reset, c_copy = st.columns(2)
+        if c_reset.button("↺ Reset to preset", help="Reset environment sliders (T, pH, O₂) to this preset's defaults."):
+            st.session_state["T"] = float(org.T_opt)
+            st.session_state["pH"] = float(org.pH_opt)
+            st.session_state["O2"] = 21.0 if org.O2_pref.lower() == "aerobic" else 0.5
+            st.toast("Environment reset.", icon="🔄")
+
+        if c_copy.button("➡️ Copy to custom", help="Clone this preset into your Custom library to tweak it."):
+            new_idx = add_from_preset(org)
+            # Queue the switch and rerun so radio builds with the updated value safely
+            st.session_state["_pending_source"] = "Custom library"
+            st.session_state["_pending_custom_select_idx"] = int(new_idx)
+            st.rerun()
+
+        # Keep env tied when changing presets
+        if st.session_state.get("_last_org_key") != ("Preset", org_name):
+            st.session_state["T"] = float(org.T_opt)
+            st.session_state["pH"] = float(org.pH_opt)
+            st.session_state["O2"] = 21.0 if org.O2_pref.lower() == "aerobic" else 0.5
+            st.session_state["_last_org_key"] = ("Preset", org_name)
 
     else:
-        prior = get_ns(cur, "organism", {})
-        st.text_input(
-            "Name",
-            value=str(prior.get("name", "Custom organism")),
-            key=f"{cur}::org_custom_name",
-        )
-        cA, cB, cC = st.columns(3)
-        O2_pref = cA.selectbox(
+        # Custom library UI
+        catalog = get_catalog()
+        names = [r.get("name", f"Custom {i+1}") for i, r in enumerate(catalog)]
+        sel_idx = int(get_selected_idx())
+
+        top = st.columns([5, 1, 1, 1, 1])
+        with top[0]:
+            selected_label = st.selectbox(
+                "Custom culture",
+                names,
+                index=sel_idx,
+                key="custom_sel_box",
+                help="Pick an entry from your custom library."
+            )
+            new_idx = names.index(selected_label)
+        if new_idx != sel_idx:
+            set_selected(int(new_idx))
+            sel_idx = int(get_selected_idx())
+
+        if top[1].button("➕", help="Add a blank culture.", key="cust_add", type="secondary", use_container_width=True):
+            set_selected(add_new_culture())
+            sel_idx = int(get_selected_idx())
+
+        if top[2].button("📄", help="Duplicate selected culture.", key="cust_dup", type="secondary", use_container_width=True):
+            set_selected(duplicate_culture(int(sel_idx)))
+            sel_idx = int(get_selected_idx())
+
+        if top[3].button("🗑️", help="Delete selected culture (keeps at least one).", key="cust_del", type="secondary", use_container_width=True):
+            delete_culture(int(sel_idx))
+            sel_idx = int(get_selected_idx())
+
+        with top[4]:
+            pop = st.popover("⋯", use_container_width=True)
+            with pop:
+                st.caption("Import / Export")
+                up = st.file_uploader("Import JSON", type=["json"])
+                if up is not None:
+                    import_catalog_json(up.getvalue())
+                    sel_idx = int(get_selected_idx())
+                st.download_button(
+                    "Export library (JSON)",
+                    data=export_catalog_json(),
+                    file_name="custom_cultures.json",
+                    use_container_width=True
+                )
+
+        # Form for selected record
+        catalog = get_catalog()
+        if not catalog:
+            set_selected(add_new_culture())
+            catalog = get_catalog()
+            sel_idx = int(get_selected_idx())
+
+        rec = dict(catalog[min(max(0, sel_idx), len(catalog) - 1)])
+
+        c1, c2 = st.columns([2, 1], gap="small")
+        rec["name"] = c1.text_input("Name", value=str(rec.get("name", "Custom culture")), key="cust_name",
+                                    help="A friendly label for this culture.")
+        rec["O2_pref"] = c2.selectbox(
             "O₂ preference",
             ["aerobic", "anaerobic", "microaerophilic"],
-            index=["aerobic","anaerobic","microaerophilic"].index(str(prior.get("O2_pref","anaerobic"))),
-            key=f"{cur}::org_custom_o2pref",
+            index=["aerobic", "anaerobic", "microaerophilic"].index(str(rec.get("O2_pref", "aerobic"))),
+            key="cust_o2",
+            help="Guides O₂ penalty and default autos."
         )
-        auto_refs_key = f"{cur}::org_custom_auto_refs"
-        if auto_refs_key not in st.session_state:
-            st.session_state[auto_refs_key] = bool(prior.get("auto_refs", True))
-        auto_refs = st.toggle(
-            "Auto-estimate μ_ref / K_ref / lag_ref",
-            key=auto_refs_key,
-        )
-        T_opt  = cB.number_input(
+
+        c3, c4 = st.columns(2, gap="small")
+        rec["T_opt"] = c3.number_input(
             "T_opt (°C)",
-            value=as_float(prior.get("T_opt"), 30.0),
+            value=float(rec.get("T_opt", 30.0)),
             step=0.5,
-            key=f"{cur}::org_custom_Topt",
+            key="cust_T",
+            help="Temperature of maximal fitness."
         )
-        pH_opt = cC.number_input(
+        rec["pH_opt"] = c4.number_input(
             "pH_opt",
-            value=as_float(prior.get("pH_opt"), 7.3),
+            value=float(rec.get("pH_opt", 7.0)),
             step=0.1, format="%.2f",
-            key=f"{cur}::org_custom_pHopt",
-        )
-        c1, c2, c3 = st.columns(3)
-        mu_ref = c1.number_input(
-            "μ_ref (ln/h)",
-            value=as_float(prior.get("mu_ref"), 0.35),
-            min_value=0.01, step=0.01,
-            disabled=st.session_state[auto_refs_key],
-            key=f"{cur}::org_custom_mu",
-        )
-        K_ref  = c2.number_input(
-            "K_ref (OD)",
-            value=as_float(prior.get("K_ref"), 4.0),
-            min_value=0.2, step=0.1,
-            disabled=st.session_state[auto_refs_key],
-            key=f"{cur}::org_custom_K",
-        )
-        lag_h  = c3.number_input(
-            "Lag_ref (h)",
-            value=as_float(prior.get("lag_ref_h"), 2.0),
-            min_value=0.01, step=0.05,
-            disabled=st.session_state[auto_refs_key],
-            key=f"{cur}::org_custom_lag",
-        )
-        c4, c5 = st.columns(2)
-        cfu_per_od = c4.number_input(
-            "CFU per OD600 (1/mL)",
-            value=as_float(prior.get("cfu_per_od"), 4e8),
-            step=1e7, format="%.0f",
-            key=f"{cur}::org_custom_cfu_scale",
-        )
-        o2_tol_pct = c5.number_input(
-            "O₂ tolerance threshold (%)",
-            value=as_float(prior.get("o2_tol_pct"), 0.5),
-            min_value=0.0, step=0.1,
-            key=f"{cur}::org_custom_o2tol",
-        )
-        notes = st.text_input(
-            "Notes",
-            value=str(prior.get("notes", "User-defined organism parameters")),
-            key=f"{cur}::org_custom_notes",
+            key="cust_pH",
+            help="pH of maximal fitness."
         )
 
-        org = dict(
-            mode="Custom",
-            name=st.session_state[f"{cur}::org_custom_name"],
-            O2_pref=st.session_state[f"{cur}::org_custom_o2pref"],
-            T_opt=float(st.session_state[f"{cur}::org_custom_Topt"]),
-            pH_opt=float(st.session_state[f"{cur}::org_custom_pHopt"]),
-            mu_ref=float(st.session_state[f"{cur}::org_custom_mu"]),
-            K_ref=float(st.session_state[f"{cur}::org_custom_K"]),
-            lag_ref_h=float(st.session_state[f"{cur}::org_custom_lag"]),
-            cfu_per_od=float(st.session_state[f"{cur}::org_custom_cfu_scale"]),
-            o2_tol_pct=float(st.session_state[f"{cur}::org_custom_o2tol"]),
-            notes=st.session_state[f"{cur}::org_custom_notes"],
-            auto_refs=bool(st.session_state[auto_refs_key]),
-        )
-        set_ns(cur, "organism", org)
+        with st.expander("Growth references", expanded=False):
+            a1, a2, a3 = st.columns(3, gap="small")
+            rec["mu_ref_auto"] = a1.checkbox(
+                "Auto μ_ref",
+                value=bool(rec.get("mu_ref_auto", True)),
+                key="cust_mu_auto",
+                help="If ON, μ_ref is guessed from O₂ preference; OFF lets you set it."
+            )
+            rec["K_ref_auto"] = a2.checkbox(
+                "Auto K_ref",
+                value=bool(rec.get("K_ref_auto", True)),
+                key="cust_K_auto",
+                help="If ON, K_ref (OD) is guessed; OFF lets you set it."
+            )
+            rec["lag_ref_auto"] = a3.checkbox(
+                "Auto lag_ref",
+                value=bool(rec.get("lag_ref_auto", True)),
+                key="cust_lag_auto",
+                help="If ON, lag_ref (h) is guessed; OFF lets you set it."
+            )
 
-    # --- Respiration & Gas (fixed: toggles/selects keep state without double-click) ---
-    st.caption("Respiration & Gas")
-    env_prior = get_ns(cur, "env", {})
+            d_mu, d_K, d_lag, d_cfu = default_by_o2(rec.get("O2_pref", "aerobic"))
+            b1, b2, b3 = st.columns(3, gap="small")
 
-    auto_key = f"{cur}::auto_anaerobe"
-    if auto_key not in st.session_state:
-        st.session_state[auto_key] = bool(env_prior.get("auto_anaerobe", True))
-    auto_anaerobe = st.toggle("Auto anaerobe settings (acceptor & ORP)", key=auto_key)
+            mu_val = d_mu if rec["mu_ref_auto"] else float(rec.get("mu_ref", d_mu))
+            K_val = d_K if rec["K_ref_auto"] else float(rec.get("K_ref", d_K))
+            lag_val = d_lag if rec["lag_ref_auto"] else float(rec.get("lag_ref_h", d_lag))
 
-    acceptor_key = f"{cur}::acceptor"
-    if acceptor_key not in st.session_state:
-        st.session_state[acceptor_key] = str(env_prior.get("acceptor", "auto"))
-    orp_key = f"{cur}::orp_mv"
-    if orp_key not in st.session_state:
-        st.session_state[orp_key] = float(as_float(env_prior.get("orp_mv"), -250.0))
+            if rec["mu_ref_auto"]:
+                b1.markdown(f"μ_ref (auto): **{mu_val:.2f} ln/h**")
+                rec["mu_ref"] = None
+            else:
+                rec["mu_ref"] = b1.number_input("μ_ref (ln/h)", value=mu_val, min_value=0.01, step=0.01, key="cust_mu")
 
-    r1, r2 = st.columns(2)
-    acceptor = r1.selectbox(
-        "Electron acceptor",
-        ["auto", "nitrate (NO₃⁻)","nitrite (NO₂⁻)","Mn(IV) (MnO₂)","none"],
-        index=["auto", "nitrate (NO₃⁻)","nitrite (NO₂⁻)","Mn(IV) (MnO₂)","none"].index(st.session_state[acceptor_key]),
-        key=acceptor_key,
-        disabled=st.session_state[auto_key],
-    )
-    orp_mv = r2.number_input(
-        "ORP setpoint (mV)",
-        value=float(st.session_state[orp_key]),
-        step=10.0,
-        help="Keep ≤ −200 mV for strict anaerobes; more negative often safer.",
-        key=orp_key,
-        disabled=st.session_state[auto_key],
-    )
+            if rec["K_ref_auto"]:
+                b2.markdown(f"K_ref (auto): **{K_val:.1f} OD**")
+                rec["K_ref"] = None
+            else:
+                rec["K_ref"] = b2.number_input("K_ref (OD)", value=K_val, min_value=0.2, step=0.1, key="cust_K")
 
-    if st.session_state[auto_key]:
-        # Derive automatic targets but also keep user's manual selections stored
-        acceptor = "nitrate (NO₃⁻)" if (org["O2_pref"] == "anaerobic") else "none"
-        orp_mv = -250.0 if (org["O2_pref"] == "anaerobic") else -100.0
+            if rec["lag_ref_auto"]:
+                b3.markdown(f"Lag_ref (auto): **{lag_val:.2f} h**")
+                rec["lag_ref_h"] = None
+            else:
+                rec["lag_ref_h"] = b3.number_input("Lag_ref (h)", value=lag_val, min_value=0.0, step=0.1, key="cust_lag")
 
-    g1, g2 = st.columns(2)
-    co2_key = f"{cur}::co2_pct"
-    if co2_key not in st.session_state:
-        st.session_state[co2_key] = float(as_float(env_prior.get("co2_pct"), 10.0))
-    overp_key = f"{cur}::overpress"
-    if overp_key not in st.session_state:
-        st.session_state[overp_key] = float(as_float(env_prior.get("overpress"), 0.0))
-    co2_pct = g1.slider("CO₂ in headspace (%)", 0.0, 30.0, float(st.session_state[co2_key]), 1.0, key=co2_key)
-    overpress = g2.number_input("Overpressure (mbar)", value=float(st.session_state[overp_key]), step=10.0, key=overp_key)
+        with st.expander("Extras (optional)", expanded=False):
+            e1, e2, e3 = st.columns(3, gap="small")
+            _, _, _, d_cfu = default_by_o2(rec.get("O2_pref", "aerobic"))
+            rec["cfu_per_od"] = e1.number_input(
+                "CFU per OD600 (heuristic)",
+                value=float(rec.get("cfu_per_od", d_cfu)),
+                step=1e8, format="%.0f", key="cust_cfu",
+                help="Used for OD→CFU conversion in growth plots."
+            )
+            rec["orp_mV"] = e2.text_input("ORP setpoint (mV)", value=str(rec.get("orp_mV") or ""), key="cust_orp",
+                                          help="Optional process control target.")
+            rec["electron_acceptor"] = e3.text_input("Electron acceptor", value=str(rec.get("electron_acceptor") or ""), key="cust_ea",
+                                                     help="e.g., nitrate, fumarate (optional).")
+            rec["notes"] = st.text_area("Notes", value=str(rec.get("notes") or ""), key="cust_notes")
 
-    redox_key = f"{cur}::redox_ind"
-    if redox_key not in st.session_state:
-        st.session_state[redox_key] = bool(env_prior.get("redox_ind", True))
-    redox_ind = st.toggle("Use resazurin indicator", key=redox_key)
+        update_selected(rec)
+        org = record_to_preset(rec)
 
-    # --- Environment ---
-    st.caption("Environment")
-    c1, c2 = st.columns(2)
-    T_key = f"{cur}::T"
-    if T_key not in st.session_state:
-        st.session_state[T_key] = float(as_float(env_prior.get("T"), org["T_opt"]))
-    pH_key = f"{cur}::pH"
-    if pH_key not in st.session_state:
-        st.session_state[pH_key] = float(as_float(env_prior.get("pH"), org["pH_opt"]))
-    O2_key = f"{cur}::O2"
-    if O2_key not in st.session_state:
-        st.session_state[O2_key] = float(as_float(env_prior.get("O2"), 0.5 if org["O2_pref"]=="anaerobic" else 21.0))
+        if st.session_state.get("_last_org_key") != ("Custom", org.name):
+            st.session_state["T"] = float(org.T_opt)
+            st.session_state["pH"] = float(org.pH_opt)
+            st.session_state["O2"] = 21.0 if org.O2_pref.lower() == "aerobic" else 0.5
+            st.session_state["_last_org_key"] = ("Custom", org.name)
 
-    T = c1.number_input("Temperature (°C)", value=float(st.session_state[T_key]), step=0.5, key=T_key)
-    pH = c2.number_input("pH", value=float(st.session_state[pH_key]), step=0.1, format="%.2f", key=pH_key)
-    O2 = st.slider("Dissolved/Headspace O₂ (%)", 0.0, 21.0, float(st.session_state[O2_key]), 0.1, key=O2_key)
+    # Environment
+    with st.expander("Environment", expanded=True):
+        c1, c2 = st.columns(2, gap="small")
+        T = c1.number_input("Temperature (°C)", value=float(st.session_state.get("T", 30.0)), step=0.5, key="T")
+        pH = c2.number_input("pH", value=float(st.session_state.get("pH", 7.0)), step=0.1, format="%.2f", key="pH")
+        O2 = st.slider("Dissolved/Headspace O₂ (%)", 0.0, 21.0, float(st.session_state.get("O2", 21.0)), 0.1, key="O2")
 
-    # --- Medium planner ---
-    st.caption("Medium planner (smart)")
-    m1, m2 = st.columns(2)
-    carb_key = f"{cur}::carbon_gL"
-    if carb_key not in st.session_state:
-        st.session_state[carb_key] = float(as_float(env_prior.get("carbon_gL"), 10.0))
-    n_key = f"{cur}::N_mM"
-    if n_key not in st.session_state:
-        st.session_state[n_key] = float(as_float(env_prior.get("N_mM"), 15.0))
-    carbon_gL = m1.slider("Carbon source (g/L)", 0.0, 30.0, float(st.session_state[carb_key]), 0.5, key=carb_key)
-    N_mM     = m2.slider("Nitrogen (mM)", 0.0, 50.0, float(st.session_state[n_key]), 1.0, key=n_key)
+    # Medium
+    with st.expander("Medium planner", expanded=False):
+        m1, m2 = st.columns(2, gap="small")
+        carbon_gL = m1.slider("Carbon source (g/L)", 0.0, 30.0, float(st.session_state.get("carbon_gL", 10.0)), 0.5, key="carbon_gL")
+        N_mM = m2.slider("Nitrogen (mM)", 0.0, 50.0, float(st.session_state.get("N_mM", 15.0)), 1.0, key="N_mM")
+        salts_ok = st.checkbox("Buffer & salts OK (phosphate, Mg²⁺, etc.)", value=bool(st.session_state.get("salts_ok", True)), key="salts_ok")
+        trace_ok = st.checkbox("Trace metals OK (Fe, Mo/W, etc.)", value=bool(st.session_state.get("trace_ok", True)), key="trace_ok")
+        vitamins_ok = st.checkbox("Vitamins/biotin OK", value=bool(st.session_state.get("vitamins_ok", True)), key="vitamins_ok")
+    medium_score = medium_quality_score(carbon_gL, N_mM, salts_ok, trace_ok, vitamins_ok)
 
-    b1, b2, b3 = st.columns(3)
-    buffer_key = f"{cur}::buffer_sys"
-    if buffer_key not in st.session_state:
-        st.session_state[buffer_key] = str(env_prior.get("buffer_sys", "bicarbonate"))
-    reducer_key = f"{cur}::reducer"
-    if reducer_key not in st.session_state:
-        st.session_state[reducer_key] = str(env_prior.get("reducer", "ascorbate"))
-    salts_key = f"{cur}::salts_ok"
-    if salts_key not in st.session_state:
-        st.session_state[salts_key] = bool(env_prior.get("salts_ok", True))
+    # Activity constants
+    with st.expander("Lab constants (activity)", expanded=False):
+        c3, c4 = st.columns(2, gap="small")
+        epsilon = c3.number_input("ε (mM⁻¹·cm⁻¹)", value=float(st.session_state.get("epsilon", 3.40)),
+                                  min_value=0.0001, step=0.01, key="epsilon")
+        path_cm = c4.number_input("Path length (cm)", value=float(st.session_state.get("path_cm", 1.00)),
+                                  min_value=0.01, step=0.01, key="path_cm")
+        c5, c6 = st.columns(2, gap="small")
+        V_rxn_mL = c5.number_input("V_rxn (mL)", value=float(st.session_state.get("V_rxn_mL", 1.000)),
+                                   min_value=0.01, step=0.01, key="V_rxn_mL")
+        V_samp_mL = c6.number_input("V_samp (mL)", value=float(st.session_state.get("V_samp_mL", 0.010)),
+                                    min_value=0.001, step=0.001, key="V_samp_mL")
 
-    buffer_sys = b1.selectbox("Buffer", ["phosphate","bicarbonate"],
-                              index=["phosphate","bicarbonate"].index(st.session_state[buffer_key]),
-                              key=buffer_key)
-    reducer = b2.selectbox("Reducing agent", ["ascorbate","cysteine","DTT","none"],
-                           index=["ascorbate","cysteine","DTT","none"].index(st.session_state[reducer_key]),
-                           key=reducer_key)
-    salts_ok  = b3.checkbox("Trace salts/vitamins OK", value=bool(st.session_state[salts_key]), key=salts_key)
+# Resolve active organism
+if st.session_state.get("org_source") == "Preset":
+    org = ORGANISMS[st.session_state["org_name"]]
+else:
+    current_catalog = get_catalog()
+    idx = int(get_selected_idx())
+    org = record_to_preset(current_catalog[min(max(0, idx), len(current_catalog) - 1)])
 
-    cn_target = (carbon_gL/12.0) / max(1e-6, (N_mM/1000.0))
-    st.caption(f"C:N helper (mol ratio, rough): **{cn_target:.1f}**")
+# Effective params given current environment
+env = dict(
+    T=float(st.session_state["T"]),
+    pH=float(st.session_state["pH"]),
+    O2=float(st.session_state["O2"]),
+    medium_score=float(medium_score),
+    T_opt=float(org.T_opt),
+    pH_opt=float(org.pH_opt),
+    O2_pref=str(org.O2_pref),
+)
+mu_eff, K_eff, lag_eff, comps = adjust_params_by_environment(org.mu_ref, org.K_ref, org.lag_ref_h, env)
 
-    # --- Lab constants (activity) ---
-    st.caption("Lab constants (activity)")
-    const_prior = get_ns(cur, "constants", {})
-    c3, c4 = st.columns(2)
-    eps_key = f"{cur}::epsilon"
-    if eps_key not in st.session_state:
-        st.session_state[eps_key] = float(as_float(const_prior.get("epsilon"), 3.40))
-    path_key = f"{cur}::path_cm"
-    if path_key not in st.session_state:
-        st.session_state[path_key] = float(as_float(const_prior.get("path_cm"), 1.00))
-    c3.number_input("ε (mM⁻¹·cm⁻¹)", value=float(st.session_state[eps_key]), min_value=0.0001, step=0.01, key=eps_key)
-    c4.number_input("Path length (cm)", value=float(st.session_state[path_key]), min_value=0.01, step=0.01, key=path_key)
-    c5, c6 = st.columns(2)
-    vrx_key = f"{cur}::V_rxn_mL"
-    if vrx_key not in st.session_state:
-        st.session_state[vrx_key] = float(as_float(const_prior.get("V_rxn_mL"), 1.000))
-    vs_key = f"{cur}::V_samp_mL"
-    if vs_key not in st.session_state:
-        st.session_state[vs_key] = float(as_float(const_prior.get("V_samp_mL"), 0.010))
-    c5.number_input("V_rxn (mL)", value=float(st.session_state[vrx_key]), min_value=0.01, step=0.01, key=vrx_key)
-    c6.number_input("V_samp (mL)", value=float(st.session_state[vs_key]), min_value=0.001, step=0.001, key=vs_key)
-
-    set_ns(cur, "constants", dict(
-        epsilon=float(st.session_state[eps_key]),
-        path_cm=float(st.session_state[path_key]),
-        V_rxn_mL=float(st.session_state[vrx_key]),
-        V_samp_mL=float(st.session_state[vs_key]),
-    ))
-
-    # -- persist env & compute score/effective params
-    medium_score = medium_quality_score(
-        float(st.session_state[carb_key]),
-        float(st.session_state[n_key]),
-        bool(st.session_state[salts_key]),
-        True, True
-    )
-
-    # derive final acceptor/ORP if auto
-    final_acceptor = acceptor
-    final_orp = float(orp_mv)
-    if st.session_state[auto_key]:
-        final_acceptor = "nitrate (NO₃⁻)" if (org["O2_pref"] == "anaerobic") else "none"
-        final_orp = -250.0 if (org["O2_pref"] == "anaerobic") else -100.0
-
-    env = dict(
-        T=float(st.session_state[T_key]),
-        pH=float(st.session_state[pH_key]),
-        O2=float(st.session_state[O2_key]),
-        acceptor=final_acceptor,
-        orp_mv=final_orp,
-        auto_anaerobe=bool(st.session_state[auto_key]),
-        co2_pct=float(st.session_state[co2_key]),
-        overpress=float(st.session_state[overp_key]),
-        redox_ind=bool(st.session_state[redox_key]),
-        carbon_gL=float(st.session_state[carb_key]),
-        N_mM=float(st.session_state[n_key]),
-        buffer_sys=str(st.session_state[buffer_key]),
-        reducer=str(st.session_state[reducer_key]),
-        medium_score=medium_score,
-        T_opt=org["T_opt"], pH_opt=org["pH_opt"], O2_pref=org["O2_pref"]
-    )
-    set_ns(cur, "env", env)
-
-    # typed env for model
-    typed_env: Mapping[str, Union[float, str]] = cast(
-        Mapping[str, Union[float, str]],
-        {
-            "T": float(env["T"]),
-            "pH": float(env["pH"]),
-            "O2": float(env["O2"]),
-            "T_opt": float(org["T_opt"]),
-            "pH_opt": float(org["pH_opt"]),
-            "O2_pref": str(org["O2_pref"]),
-            "medium_score": float(env["medium_score"]),
-        },
-    )
-
-    # Choose references: manual or auto
-    use_auto_refs = bool(org.get("auto_refs", False))
-    missing_ref = any([
-        not isinstance(org.get("mu_ref"), (int,float)) or float(org.get("mu_ref", 0)) <= 0,
-        not isinstance(org.get("K_ref"), (int,float)) or float(org.get("K_ref", 0)) <= 0,
-        not isinstance(org.get("lag_ref_h"), (int,float)) or float(org.get("lag_ref_h", 0)) <= 0,
-    ])
-    if use_auto_refs or missing_ref:
-        mu_ref_use, K_ref_use, lag_ref_use = estimate_refs_from_env(str(org["O2_pref"]), typed_env)
-    else:
-        mu_ref_use  = float(org["mu_ref"])
-        K_ref_use   = float(org["K_ref"])
-        lag_ref_use = float(org["lag_ref_h"])
-
-    mu_eff, K_eff, lag_eff, comps = adjust_params_by_environment(
-        float(mu_ref_use),
-        float(K_ref_use),
-        float(lag_ref_use),
-        typed_env,
-    )
-    # ORP / acceptor modifiers
-    mu_eff *= acceptor_factor(final_acceptor)
-    mu_eff *= orp_penalty(float(final_orp), as_float(org.get("o2_tol_pct"), 0.5))
-
-    st.markdown(
-        f"""
+st.markdown(f"""
 <div class="helpbox">
-<b>{org['name']}</b><br>{org['notes']}<br>
+<b>{org.name}</b><br>{org.notes}<br>
 <hr style="margin:6px 0"/>
 <b>Effective params</b>: μ<sub>max</sub> ≈ <b>{mu_eff:.2f}</b> ln·h⁻¹ • K ≈ <b>{K_eff:.1f}</b> OD • lag ≈ <b>{lag_eff:.2f}</b> h
-<br><span class="muted">Fitness - T:{comps['tp']:.2f} pH:{comps['pp']:.2f} O₂:{comps['op']:.2f} Medium:{comps['mp']:.2f} • ORP:{final_orp:.0f} mV • Acceptor:{final_acceptor}</span>
+<br><span class="muted">Fitness components - T:{comps['tp']:.2f} pH:{comps['pp']:.2f} O₂:{comps['op']:.2f} Medium:{comps['mp']:.2f}</span>
 </div>
-""",
-        unsafe_allow_html=True
-    )
+""", unsafe_allow_html=True)
 
-tabs = st.tabs([
+# ─────────────────────────────
+# Tabs
+# ─────────────────────────────
+labels = [
     "① Culture planning",
     "② Growth simulation",
     "③ Growth monitoring (OD/CFU)",
@@ -436,22 +443,33 @@ tabs = st.tabs([
     "⑦ Purification & KPIs",
     "⑧ Plots & Export",
     "⑨ Settings & Session",
-])
+    # "⑩ Dashboard",
+    # "⑪ Batch simulation",
+]
+if _t10_ec is not None:
+    labels.append("⑫ Electrochemistry")
 
-culture = st.session_state.get("current_culture", "Culture 1")
-consts = get_ns(culture, "constants", {})
-epsilon = as_float(consts.get("epsilon"), 3.40)
-path_cm = as_float(consts.get("path_cm"), 1.00)
-V_rxn_mL = as_float(consts.get("V_rxn_mL"), 1.000)
-V_samp_mL = as_float(consts.get("V_samp_mL"), 0.010)
-org_for_tabs = get_ns(culture, "organism", org)
+tabs = st.tabs(labels)
 
-t01_planning.render(tabs[0], culture, mu_eff, K_eff)
-t02_simulation.render(tabs[1], culture, mu_eff, K_eff, lag_eff, org_for_tabs, float(epsilon), float(path_cm))
-t03_monitoring.render(tabs[2], culture)
-t04_harvest.render(tabs[3], culture)
-t05_activity.render(tabs[4], culture, float(epsilon), float(path_cm), float(V_rxn_mL), float(V_samp_mL))
-t06_bradford.render(tabs[5], culture)
-t07_purification.render(tabs[6], culture)
-t08_plots_export.render(tabs[7], culture)
-t09_settings.render(tabs[8], culture, clear_keys, env, org_for_tabs["name"])
+# shared kwargs into tabs
+common = dict(
+    mu_eff=mu_eff, K_eff=K_eff, lag_eff=lag_eff, org=org,
+    epsilon=st.session_state["epsilon"], path_cm=st.session_state["path_cm"],
+    V_rxn_mL=st.session_state["V_rxn_mL"], V_samp_mL=st.session_state["V_samp_mL"],
+    env=env, clear_keys_fn=clear_keys, clear_keys=clear_keys,
+    organism_name=org.name, culture_name=org.name, culture=org,
+)
+
+_safe_render(t01_planning, tabs[0], **common)
+_safe_render(t02_simulation, tabs[1], **common)
+_safe_render(t03_monitoring, tabs[2], **common)
+_safe_render(t04_harvest, tabs[3], **common)
+_safe_render(t05_activity, tabs[4], **common)
+_safe_render(t06_bradford, tabs[5], **common)
+_safe_render(t07_purification, tabs[6], **common)
+_safe_render(t08_plots_export, tabs[7], **common)
+_safe_render(t09_settings, tabs[8], **common)
+# _safe_render(t10_dashboard, tabs[9], **common)
+# _safe_render(t11_batch, tabs[10], **common)
+if _t10_ec is not None:
+    _safe_render(_t10_ec, tabs[-1], **common)
